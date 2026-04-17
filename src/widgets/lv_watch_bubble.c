@@ -487,29 +487,19 @@ static void refresh_icon_objects(void)
     }
 }
 
-static void init_icons(void)
+static void init_icon_slots(void)
 {
     int index = 0;
     int row = 0;
 
-    lv_color_t colors[] = {
-        lv_color_hex(0xFF3B30),
-        lv_color_hex(0xFF9500),
-        lv_color_hex(0xFFE620),
-        lv_color_hex(0x04DE71),
-        lv_color_hex(0x00F5EA),
-        lv_color_hex(0x2094FA),
-        lv_color_hex(0x787AFF),
-        lv_color_hex(0xFA114F),
-    };
-    int color_count = (int)(sizeof(colors) / sizeof(colors[0]));
+    lv_color_t default_color = lv_color_hex(0x888888);
 
     while(index < ICON_COUNT) {
         int bubble_count = (row % 2 == 0) ? 3 : 4;
         for(int col = 0; col < bubble_count && index < ICON_COUNT; col++) {
             icons[index].q = (float)row;
             icons[index].r = (float)col;
-            bubble_colors[index] = colors[index % color_count];
+            bubble_colors[index] = default_color;
             icon_srcs[index] = NULL;
             icon_user_datas[index] = NULL;
             bubble_objs[index] = NULL;
@@ -523,34 +513,36 @@ static void init_icons(void)
     default_row_center = row_center;
 }
 
-static void create_icon_objects(void)
+static void create_icon_object(uint32_t index)
 {
-    for(uint32_t i = 0; i < ICON_COUNT; i++) {
-        lv_obj_t * bubble = lv_obj_create(canvas);
-        bubble_objs[i] = bubble;
+    if(index >= ICON_COUNT) return;
+    if(canvas == NULL) return;
+    if(bubble_objs[index] != NULL || image_objs[index] != NULL) return;
 
-        lv_obj_set_size(bubble, BUBBLE_SIZE * 2, BUBBLE_SIZE * 2);
-        lv_obj_set_style_radius(bubble, LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_opa(bubble, LV_OPA_COVER, 0);
-        lv_obj_set_style_bg_color(bubble, bubble_colors[i], 0);
-        lv_obj_set_style_border_width(bubble, 0, 0);
-        lv_obj_set_style_pad_all(bubble, 0, 0);
-        lv_obj_set_style_clip_corner(bubble, true, 0);
-        lv_obj_add_flag(bubble, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(bubble, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_clear_flag(bubble, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t * bubble = lv_obj_create(canvas);
+    bubble_objs[index] = bubble;
 
-        lv_obj_t * img = lv_image_create(bubble);
-        image_objs[i] = img;
+    lv_obj_set_size(bubble, BUBBLE_SIZE * 2, BUBBLE_SIZE * 2);
+    lv_obj_set_style_radius(bubble, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(bubble, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(bubble, bubble_colors[index], 0);
+    lv_obj_set_style_border_width(bubble, 0, 0);
+    lv_obj_set_style_pad_all(bubble, 0, 0);
+    lv_obj_set_style_clip_corner(bubble, true, 0);
+    lv_obj_add_flag(bubble, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(bubble, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(bubble, LV_OBJ_FLAG_CLICKABLE);
 
-        lv_obj_set_size(img, BUBBLE_SIZE * 2, BUBBLE_SIZE * 2);
-        lv_image_set_inner_align(img, LV_IMAGE_ALIGN_COVER);
-        lv_obj_center(img);
-        lv_obj_set_style_bg_opa(img, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(img, 0, 0);
-        lv_obj_clear_flag(img, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_clear_flag(img, LV_OBJ_FLAG_CLICKABLE);
-    }
+    lv_obj_t * img = lv_image_create(bubble);
+    image_objs[index] = img;
+
+    lv_obj_set_size(img, BUBBLE_SIZE * 2, BUBBLE_SIZE * 2);
+    lv_image_set_inner_align(img, LV_IMAGE_ALIGN_COVER);
+    lv_obj_center(img);
+    lv_obj_set_style_bg_opa(img, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(img, 0, 0);
+    lv_obj_clear_flag(img, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(img, LV_OBJ_FLAG_CLICKABLE);
 }
 
 static void pressed_event(lv_event_t * e)
@@ -722,9 +714,7 @@ lv_obj_t * lv_watch_bubble_create(lv_obj_t * parent)
     lv_obj_add_flag(canvas, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(canvas, LV_OBJ_FLAG_SCROLLABLE);
 
-    init_icons();
-    create_icon_objects();
-    refresh_icon_objects();
+    init_icon_slots();
 
     lv_obj_add_event_cb(canvas, pressed_event, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(canvas, drag_event, LV_EVENT_PRESSING, NULL);
@@ -741,8 +731,15 @@ void lv_watch_bubble_set_icon_src(lv_obj_t * obj, uint32_t index, const void * s
     if(index >= ICON_COUNT) return;
 
     icon_srcs[index] = src;
+    if(src != NULL) {
+        create_icon_object(index);
+    }
+
     if(image_objs[index] && src) {
         lv_image_set_src(image_objs[index], src);
+    }
+    else if(bubble_objs[index] != NULL && image_objs[index] != NULL) {
+        lv_obj_add_flag(bubble_objs[index], LV_OBJ_FLAG_HIDDEN);
     }
 
     {
