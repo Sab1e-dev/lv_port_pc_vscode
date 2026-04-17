@@ -25,10 +25,13 @@
 #include <SDL.h>
 
 #include "hal/hal.h"
+#include "widgets/lv_watch_bubble.h"
 
 /*********************
  *      DEFINES
  *********************/
+
+#define SOLID_ICON_COUNT 8
 
 /**********************
  *      TYPEDEFS
@@ -38,9 +41,103 @@
  *  STATIC PROTOTYPES
  **********************/
 
+static void bubble_icon_click_cb(uint32_t index, void * icon_user_data, void * user_ctx);
+
 /**********************
  *  STATIC VARIABLES
  **********************/
+
+static const uint8_t icon_red_map[] = {0xFF, 0x3B, 0x30, 0xFF};
+static const uint8_t icon_orange_map[] = {0xFF, 0x95, 0x00, 0xFF};
+static const uint8_t icon_yellow_map[] = {0xFF, 0xE6, 0x20, 0xFF};
+static const uint8_t icon_green_map[] = {0x04, 0xDE, 0x71, 0xFF};
+static const uint8_t icon_cyan_map[] = {0x00, 0xF5, 0xEA, 0xFF};
+static const uint8_t icon_blue_map[] = {0x20, 0x94, 0xFA, 0xFF};
+static const uint8_t icon_indigo_map[] = {0x78, 0x7A, 0xFF, 0xFF};
+static const uint8_t icon_pink_map[] = {0xFA, 0x11, 0x4F, 0xFF};
+
+static const lv_img_dsc_t icon_red = {
+  .header.magic = LV_IMAGE_HEADER_MAGIC,
+  .header.w = 1,
+  .header.h = 1,
+  .header.cf = LV_COLOR_FORMAT_ARGB8888,
+  .data_size = 4,
+  .data = icon_red_map,
+};
+
+static const lv_img_dsc_t icon_orange = {
+  .header.magic = LV_IMAGE_HEADER_MAGIC,
+  .header.w = 1,
+  .header.h = 1,
+  .header.cf = LV_COLOR_FORMAT_ARGB8888,
+  .data_size = 4,
+  .data = icon_orange_map,
+};
+
+static const lv_img_dsc_t icon_yellow = {
+  .header.magic = LV_IMAGE_HEADER_MAGIC,
+  .header.w = 1,
+  .header.h = 1,
+  .header.cf = LV_COLOR_FORMAT_ARGB8888,
+  .data_size = 4,
+  .data = icon_yellow_map,
+};
+
+static const lv_img_dsc_t icon_green = {
+  .header.magic = LV_IMAGE_HEADER_MAGIC,
+  .header.w = 1,
+  .header.h = 1,
+  .header.cf = LV_COLOR_FORMAT_ARGB8888,
+  .data_size = 4,
+  .data = icon_green_map,
+};
+
+static const lv_img_dsc_t icon_cyan = {
+  .header.magic = LV_IMAGE_HEADER_MAGIC,
+  .header.w = 1,
+  .header.h = 1,
+  .header.cf = LV_COLOR_FORMAT_ARGB8888,
+  .data_size = 4,
+  .data = icon_cyan_map,
+};
+
+static const lv_img_dsc_t icon_blue = {
+  .header.magic = LV_IMAGE_HEADER_MAGIC,
+  .header.w = 1,
+  .header.h = 1,
+  .header.cf = LV_COLOR_FORMAT_ARGB8888,
+  .data_size = 4,
+  .data = icon_blue_map,
+};
+
+static const lv_img_dsc_t icon_indigo = {
+  .header.magic = LV_IMAGE_HEADER_MAGIC,
+  .header.w = 1,
+  .header.h = 1,
+  .header.cf = LV_COLOR_FORMAT_ARGB8888,
+  .data_size = 4,
+  .data = icon_indigo_map,
+};
+
+static const lv_img_dsc_t icon_pink = {
+  .header.magic = LV_IMAGE_HEADER_MAGIC,
+  .header.w = 1,
+  .header.h = 1,
+  .header.cf = LV_COLOR_FORMAT_ARGB8888,
+  .data_size = 4,
+  .data = icon_pink_map,
+};
+
+static const lv_img_dsc_t * solid_icons[SOLID_ICON_COUNT] = {
+  &icon_red,
+  &icon_orange,
+  &icon_yellow,
+  &icon_green,
+  &icon_cyan,
+  &icon_blue,
+  &icon_indigo,
+  &icon_pink,
+};
 
 /**********************
  *      MACROS
@@ -61,15 +158,20 @@ int main(int argc, char **argv)
   lv_init();
 
   /*Initialize the HAL (display, input devices, tick) for LVGL*/
-  sdl_hal_init(320, 480);
+  sdl_hal_init(500, 500);
 
-  /* Run the default demo */
-  /* To try a different demo or example, replace this with one of: */
-  /* - lv_demo_benchmark(); */
-  /* - lv_demo_stress(); */
-  /* - lv_example_label_1(); */
-  /* - etc. */
-  lv_demo_widgets();
+  lv_obj_t *src = lv_screen_active();
+  lv_obj_remove_flag(src, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_bg_color(src, lv_color_black(), 0);
+
+  lv_obj_t *bubble = lv_watch_bubble_create(lv_screen_active());
+  lv_watch_bubble_set_icon_click_cb(bubble, bubble_icon_click_cb, NULL);
+
+  for(uint32_t i = 0; i < 24; i++) {
+    const lv_img_dsc_t * icon = solid_icons[i % SOLID_ICON_COUNT];
+    lv_watch_bubble_set_icon_src(bubble, i, icon);
+    lv_watch_bubble_set_icon_user_data(bubble, i, (void *)(uintptr_t)i);
+  }
 
   while(1) {
     /* Periodically call the lv_task handler.
@@ -95,3 +197,8 @@ int main(int argc, char **argv)
  *   STATIC FUNCTIONS
  **********************/
 
+static void bubble_icon_click_cb(uint32_t index, void * icon_user_data, void * user_ctx)
+{
+  LV_UNUSED(user_ctx);
+  printf("bubble icon clicked: index=%" LV_PRIu32 ", user_data=%u\n", index, (unsigned int)(uintptr_t)icon_user_data);
+}
