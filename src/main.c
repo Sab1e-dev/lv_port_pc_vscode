@@ -41,7 +41,7 @@
  *  STATIC PROTOTYPES
  **********************/
 
-static void bubble_icon_click_cb(uint32_t index, void * icon_user_data, void * user_ctx);
+static void bubble_icon_click_event_cb(lv_event_t * e);
 
 /**********************
  *  STATIC VARIABLES
@@ -165,9 +165,9 @@ int main(int argc, char **argv)
   lv_obj_set_style_bg_color(src, lv_color_black(), 0);
 
   lv_obj_t *bubble = lv_watch_bubble_create(lv_screen_active());
-  lv_watch_bubble_set_icon_click_cb(bubble, bubble_icon_click_cb, NULL);
+  lv_obj_add_event_cb(bubble, bubble_icon_click_event_cb, LV_EVENT_CLICKED, NULL);
 
-  for(uint32_t i = 0; i < 24; i++) {
+  for(uint32_t i = 0; i < 32; i++) {
     const lv_img_dsc_t * icon = solid_icons[i % SOLID_ICON_COUNT];
     lv_watch_bubble_set_icon_src(bubble, i, icon);
     lv_watch_bubble_set_icon_user_data(bubble, i, (void *)(uintptr_t)i);
@@ -197,8 +197,12 @@ int main(int argc, char **argv)
  *   STATIC FUNCTIONS
  **********************/
 
-static void bubble_icon_click_cb(uint32_t index, void * icon_user_data, void * user_ctx)
+static void bubble_icon_click_event_cb(lv_event_t * e)
 {
-  LV_UNUSED(user_ctx);
-  printf("bubble icon clicked: index=%" LV_PRIu32 ", user_data=%u\n", index, (unsigned int)(uintptr_t)icon_user_data);
+  const lv_watch_bubble_click_event_t *event_data = lv_event_get_param(e);
+  if(event_data == NULL) return;
+
+  printf("bubble icon clicked: index=%" LV_PRIu32 ", user_data=%u\n",
+         event_data->index,
+         (unsigned int)(uintptr_t)event_data->icon_user_data);
 }

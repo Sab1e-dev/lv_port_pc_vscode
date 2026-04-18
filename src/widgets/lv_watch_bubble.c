@@ -1,101 +1,344 @@
 #include "lvgl.h"
 #include "lv_watch_bubble.h"
-#include <math.h>
+#include "lvgl/src/misc/lv_ll.h"
 
-#define ICON_COUNT     64   /* Total icon count; maximum number of bubble slots. */
-#define BUBBLE_SIZE    32   /* Base bubble radius used to derive bubble and icon size. */
-#define GRID_SPACING   1.2f /* Grid spacing multiplier controlling row/column gap. */
-#define ROW_PITCH_X    (BUBBLE_SIZE * 2.0f * GRID_SPACING) /* Horizontal pitch inside a row. */
-#define ROW_PITCH_Y    (BUBBLE_SIZE * 1.7f * GRID_SPACING) /* Vertical pitch between rows. */
-#define X_DRAG_FACTOR  0.8f /* Horizontal drag sensitivity; larger means more responsive. */
-#define X_INERTIA_DAMP 0.72f /* Horizontal inertia damping; smaller stops faster. */
-#define MAX_X_OFFSET   80.0f /* Max free horizontal drag range to avoid overlap zones. */
-#define MAX_SCALE      1.0f /* Maximum icon scale in the default state. */
-#define MIN_SCALE      0.06f /* Minimum icon scale to avoid complete disappearance at edges. */
-#define X_RADIUS       120   /* Horizontal radius of the central full-scale region. */
-#define Y_RADIUS       90    /* Vertical radius used for edge-based scaling decisions. */
-#define CORNER_RADIUS  30    /* Corner fillet radius for smooth edge transitions. */
-#define FRINGE_WIDTH   120   /* Transition band width from max to min scale. */
-#define SCREEN_W       400   /* Logical view width; matches current canvas width. */
-#define SCREEN_H       400   /* Logical view height; matches current canvas height. */
-#define Y_OVERSCROLL_MAX 20.0f /* Max compression distance for vertical rubber-band effect. */
-#define Y_SPRING_K      0.22f /* Vertical spring strength; larger rebounds faster. */
-#define Y_SPRING_DAMP   0.1f /* Vertical spring damping controlling decay during rebound. */
-#define X_SPRING_K      0.30f /* Horizontal centering spring strength. */
-#define X_SPRING_DAMP   0.72f /* Horizontal centering damping for smoother return. */
-#define Y_RATCHET_STEP  (ROW_PITCH_Y * 1.20f) /* Vertical ratchet step; default snaps about one row. */
-#define Y_RATCHET_PULL  0.02f /* Mild attraction to nearest slot while dragging. */
-#define Y_RATCHET_SNAP  0.04f /* Snap strength to nearest slot after release. */
-#define Y_RATCHET_DEAD  (ROW_PITCH_Y * 1.80f) /* Dead zone threshold for click-like ratchet alignment. */
+#define FX_SHIFT 8 /* Fixed-point fractional bits. */
+#define FX_ONE (1 << FX_SHIFT) /* Fixed-point representation of 1.0. */
+#define FX_HALF (FX_ONE >> 1) /* Half of one fixed-point unit, used for rounding. */
+#define FX_FROM_INT(v) ((int32_t)(v) << FX_SHIFT) /* Convert an integer value to fixed-point. */
+#define FX_FROM_PERMILLE(p) ((int32_t)((((int64_t)(p)) * FX_ONE + 500) / 1000)) /* Convert permille to fixed-point. */
+
+#define BUBBLE_SIZE 32  /* Base bubble radius used to derive bubble and icon size. */
+
+#define ROW_PITCH_X FX_FROM_INT(77) /* Horizontal pitch inside a row. */
+#define ROW_PITCH_Y FX_FROM_INT(65) /* Vertical pitch between rows. */
+
+#define X_RADIUS FX_FROM_INT(120) /* Horizontal radius of the central full-scale region. */
+#define Y_RADIUS FX_FROM_INT(90) /* Vertical radius used for edge-based scaling decisions. */
+#define CORNER_RADIUS FX_FROM_INT(30) /* Corner fillet radius for smooth edge transitions. */
+
 #define TAP_MOVE_TOLERANCE 12 /* Allowed finger jitter for tap detection. */
-#define PRESS_SCALE 0.92f /* Scale factor when an icon is pressed. */
+#define PRESS_SCALE FX_FROM_PERMILLE(920) /* Scale factor when an icon is pressed. */
 #define PRESS_DARKEN_LVL LV_OPA_30 /* Bubble darkening intensity when pressed. */
 #define PRESS_IMAGE_DARKEN_LVL LV_OPA_40 /* Image-layer darkening intensity when pressed. */
-#define PRESS_NEIGHBOR_PULL 8.0f /* Max pull displacement applied to nearby icons while pressed. */
-#define PRESS_NEIGHBOR_RADIUS 140.0f /* Radius of neighboring icons affected by press pull. */
-#define PRESS_ANIM_IN_SPEED 0.22f /* Per-frame approach speed for press-in animation. */
-#define PRESS_ANIM_OUT_SPEED 0.18f /* Per-frame recovery speed for release/cancel animation. */
+#define PRESS_NEIGHBOR_PULL FX_FROM_INT(8) /* Max pull displacement applied to nearby icons while pressed. */
+#define PRESS_NEIGHBOR_RADIUS FX_FROM_INT(140) /* Radius of neighboring icons affected by press pull. */
+#define PRESS_ANIM_IN_SPEED FX_FROM_PERMILLE(220) /* Per-frame approach speed for press-in animation. */
+#define PRESS_ANIM_OUT_SPEED FX_FROM_PERMILLE(180) /* Per-frame recovery speed for release/cancel animation. */
+
+#define FX_EPSILON 1 /* Small epsilon for fixed-point comparisons. */
 
 typedef struct {
-    float q, r;
-} icon_t;
+    uint32_t index;
+    int32_t q;
+    int32_t r;
+    lv_color_t bubble_color;
+    const void * src;
+    void * user_data;
+    lv_obj_t * bubble_obj;
+    lv_obj_t * image_obj;
+} icon_node_t;
 
-static icon_t icons[ICON_COUNT];
-static lv_color_t bubble_colors[ICON_COUNT];
-static const void * icon_srcs[ICON_COUNT];
-static void * icon_user_datas[ICON_COUNT];
+typedef struct {
+    lv_obj_t * container;
+    lv_ll_t icon_ll;
+    bool icon_ll_ready;
 
-static lv_obj_t * bubble_objs[ICON_COUNT];
-static lv_obj_t * image_objs[ICON_COUNT];
+    int32_t offset_x;
+    int32_t offset_y;
+    int32_t velocity_x;
+    int32_t velocity_y;
+    int32_t row_center;
+    int32_t default_row_center;
+    int pressed_icon_index;
+    int press_candidate_index;
+    int32_t press_anim_progress;
+    int32_t press_anim_target;
+    lv_point_t press_start_point;
+    bool press_moved;
+    bool pointer_is_down;
+    bool dispatching_custom_click;
+    bool pending_click_valid;
+    lv_watch_bubble_click_event_t pending_click;
+    lv_watch_bubble_config_t config;
+    bool needs_refresh;
 
-static float offset_x = 0;
-static float offset_y = 0;
-static float velocity_x = 0;
-static float velocity_y = 0;
-static float row_center = 0;
-static float default_row_center = 0;
-static int pressed_icon_index = -1;
-static int press_candidate_index = -1;
-static float press_anim_progress = 0.0f;
-static float press_anim_target = 0.0f;
-static lv_point_t press_start_point;
-static bool press_moved = false;
-static bool pointer_is_down = false;
+    lv_timer_t * inertia_timer;
+} watch_bubble_t;
 
-/* Keep the variable name for minimal external behavior change */
-static lv_obj_t * canvas;
+static void refresh_icon_objects(watch_bubble_t * wb);
 
-static lv_watch_bubble_icon_click_cb_t icon_click_cb = NULL;
-static void * icon_click_user_ctx = NULL;
-
-static bool is_component_obj(lv_obj_t * obj)
+static inline int32_t fx_abs(int32_t v)
 {
-    return obj != NULL && obj == canvas;
+    return v >= 0 ? v : -v;
 }
 
-static float clampf(float v, float min_v, float max_v)
+static inline int32_t fx_clamp(int32_t v, int32_t min_v, int32_t max_v)
 {
     if(v < min_v) return min_v;
     if(v > max_v) return max_v;
     return v;
 }
 
-static float round_to_step(float value, float step)
+static inline int32_t fx_mul(int32_t a, int32_t b)
 {
-    if(step <= 1e-6f) return value;
-    return roundf(value / step) * step;
+    int64_t prod = (int64_t)a * (int64_t)b;
+    if(prod >= 0) prod += FX_HALF;
+    else prod -= FX_HALF;
+    return (int32_t)(prod >> FX_SHIFT);
 }
 
-static void update_active_row_center(void)
+static inline int32_t fx_div(int32_t a, int32_t b)
+{
+    if(b == 0) return 0;
+
+    int64_t num = (int64_t)a << FX_SHIFT;
+    int64_t den = (int64_t)b;
+    if((num ^ den) >= 0) num += fx_abs((int32_t)den) / 2;
+    else num -= fx_abs((int32_t)den) / 2;
+
+    return (int32_t)(num / den);
+}
+
+static inline int32_t fx_to_int_round(int32_t v)
+{
+    if(v >= 0) return (v + FX_HALF) >> FX_SHIFT;
+    return -(((-v) + FX_HALF) >> FX_SHIFT);
+}
+
+static inline int32_t fx_lerp(int32_t actual_min, int32_t actual_max, int32_t val, int32_t target_min, int32_t target_max)
+{
+    int32_t span = actual_max - actual_min;
+    if(span == 0) return target_min;
+
+    int64_t delta = (int64_t)(val - actual_min) * (int64_t)(target_max - target_min);
+    return target_min + (int32_t)(delta / span);
+}
+
+static int32_t fx_round_to_step(int32_t value, int32_t step)
+{
+    if(step <= 0) return value;
+
+    int32_t half = step / 2;
+    if(value >= 0) return ((value + half) / step) * step;
+    return -(((-value + half) / step) * step);
+}
+
+static int32_t fx_sqrt_u64(uint64_t value)
+{
+    if(value == 0) return 0;
+
+    uint64_t x = value;
+    uint64_t y = (x + 1) >> 1;
+    while(y < x) {
+        x = y;
+        y = (x + value / x) >> 1;
+    }
+
+    return (int32_t)x;
+}
+
+static int32_t get_view_w_fx(const watch_bubble_t * wb)
+{
+    int32_t w = (wb != NULL && wb->container != NULL) ? lv_obj_get_width(wb->container) : 0;
+    if(w < 1) w = 1;
+    return FX_FROM_INT(w);
+}
+
+static int32_t get_view_h_fx(const watch_bubble_t * wb)
+{
+    int32_t h = (wb != NULL && wb->container != NULL) ? lv_obj_get_height(wb->container) : 0;
+    if(h < 1) h = 1;
+    return FX_FROM_INT(h);
+}
+
+static void init_default_config(lv_watch_bubble_config_t * cfg)
+{
+    if(cfg == NULL) return;
+
+    cfg->x_drag_factor_permille = 800;
+    cfg->x_inertia_damp_permille = 720;
+    cfg->max_x_offset_px = 80;
+    cfg->max_scale_permille = 1000;
+    cfg->min_scale_permille = 60;
+    cfg->fringe_width_px = 120;
+    cfg->y_overscroll_max_px = 20;
+    cfg->y_spring_k_permille = 220;
+    cfg->y_spring_damp_permille = 100;
+    cfg->x_spring_k_permille = 300;
+    cfg->x_spring_damp_permille = 720;
+    cfg->y_ratchet_step_px = 78;
+    cfg->y_ratchet_pull_permille = 20;
+    cfg->y_ratchet_snap_permille = 40;
+    cfg->y_ratchet_dead_px = 118;
+}
+
+static void sanitize_config(lv_watch_bubble_config_t * cfg)
+{
+    if(cfg == NULL) return;
+
+    cfg->x_drag_factor_permille = LV_MAX(1, cfg->x_drag_factor_permille);
+    cfg->x_inertia_damp_permille = LV_MAX(1, cfg->x_inertia_damp_permille);
+    cfg->max_x_offset_px = LV_MAX(0, cfg->max_x_offset_px);
+    cfg->max_scale_permille = LV_MAX(1, cfg->max_scale_permille);
+    cfg->min_scale_permille = LV_MAX(1, cfg->min_scale_permille);
+    cfg->fringe_width_px = LV_MAX(1, cfg->fringe_width_px);
+    cfg->y_overscroll_max_px = LV_MAX(1, cfg->y_overscroll_max_px);
+    cfg->y_spring_k_permille = LV_MAX(1, cfg->y_spring_k_permille);
+    cfg->y_spring_damp_permille = LV_MAX(1, cfg->y_spring_damp_permille);
+    cfg->x_spring_k_permille = LV_MAX(1, cfg->x_spring_k_permille);
+    cfg->x_spring_damp_permille = LV_MAX(1, cfg->x_spring_damp_permille);
+    cfg->y_ratchet_step_px = LV_MAX(1, cfg->y_ratchet_step_px);
+    cfg->y_ratchet_pull_permille = LV_MAX(1, cfg->y_ratchet_pull_permille);
+    cfg->y_ratchet_snap_permille = LV_MAX(1, cfg->y_ratchet_snap_permille);
+    cfg->y_ratchet_dead_px = LV_MAX(1, cfg->y_ratchet_dead_px);
+
+    if(cfg->min_scale_permille > cfg->max_scale_permille) {
+        uint16_t tmp = cfg->min_scale_permille;
+        cfg->min_scale_permille = cfg->max_scale_permille;
+        cfg->max_scale_permille = tmp;
+    }
+}
+
+static inline int32_t cfg_permille(uint16_t v)
+{
+    return FX_FROM_PERMILLE(v);
+}
+
+static inline int32_t cfg_px(int16_t v)
+{
+    return FX_FROM_INT(v);
+}
+
+static void mark_refresh(watch_bubble_t * wb)
+{
+    if(wb != NULL) wb->needs_refresh = true;
+}
+
+static void refresh_if_needed(watch_bubble_t * wb)
+{
+    if(wb == NULL || !wb->needs_refresh) return;
+    refresh_icon_objects(wb);
+    wb->needs_refresh = false;
+}
+
+static watch_bubble_t * get_instance(lv_obj_t * obj)
+{
+    if(obj == NULL) return NULL;
+    return (watch_bubble_t *)lv_obj_get_user_data(obj);
+}
+
+static bool is_component_obj(lv_obj_t * obj)
+{
+    watch_bubble_t * wb = get_instance(obj);
+    return wb != NULL && wb->container == obj;
+}
+
+static icon_node_t * get_icon_node_by_index(watch_bubble_t * wb, uint32_t index)
+{
+    if(wb == NULL || !wb->icon_ll_ready) return NULL;
+
+    icon_node_t * node;
+    LV_LL_READ(&wb->icon_ll, node) {
+        if(node->index == index) return node;
+    }
+
+    return NULL;
+}
+
+static void index_to_row_col(uint32_t index, int32_t * out_row, int32_t * out_col)
+{
+    uint32_t row = 0;
+    uint32_t consumed = 0;
+
+    while(1) {
+        uint32_t bubble_count = (row % 2U == 0U) ? 3U : 4U;
+        if(index < consumed + bubble_count) {
+            *out_row = (int32_t)row;
+            *out_col = (int32_t)(index - consumed);
+            return;
+        }
+
+        consumed += bubble_count;
+        row++;
+    }
+}
+
+static icon_node_t * ensure_icon_node_by_index(watch_bubble_t * wb, uint32_t index)
+{
+    if(wb == NULL || !wb->icon_ll_ready) return NULL;
+
+    icon_node_t * found = get_icon_node_by_index(wb, index);
+    if(found != NULL) return found;
+
+    uint32_t next_index = 0;
+    icon_node_t * tail = lv_ll_get_tail(&wb->icon_ll);
+    if(tail != NULL) {
+        next_index = tail->index + 1U;
+    }
+
+    lv_color_t default_color = lv_color_hex(0x888888);
+
+    for(uint32_t i = next_index; i <= index; i++) {
+        icon_node_t * node = lv_ll_ins_tail(&wb->icon_ll);
+        if(node == NULL) {
+            return get_icon_node_by_index(wb, index);
+        }
+
+        int32_t row;
+        int32_t col;
+        index_to_row_col(i, &row, &col);
+
+        node->index = i;
+        node->q = row;
+        node->r = col;
+        node->bubble_color = default_color;
+        node->src = NULL;
+        node->user_data = NULL;
+        node->bubble_obj = NULL;
+        node->image_obj = NULL;
+    }
+
+    if(index > 0) {
+        int32_t last_row;
+        int32_t last_col;
+        index_to_row_col(index, &last_row, &last_col);
+        LV_UNUSED(last_col);
+        wb->default_row_center = (last_row * FX_ONE) / 2;
+    }
+
+    return get_icon_node_by_index(wb, index);
+}
+
+static void clear_icon_list(watch_bubble_t * wb)
+{
+    if(wb == NULL || !wb->icon_ll_ready) return;
+
+    icon_node_t * node = lv_ll_get_head(&wb->icon_ll);
+    while(node != NULL) {
+        icon_node_t * next = lv_ll_get_next(&wb->icon_ll, node);
+        if(node->bubble_obj != NULL) {
+            lv_obj_del(node->bubble_obj);
+            node->bubble_obj = NULL;
+            node->image_obj = NULL;
+        }
+        lv_ll_remove(&wb->icon_ll, node);
+        lv_free(node);
+        node = next;
+    }
+}
+
+static void update_active_row_center(watch_bubble_t * wb)
 {
     bool has_active = false;
-    float min_row = 0.0f;
-    float max_row = 0.0f;
+    int32_t min_row = 0;
+    int32_t max_row = 0;
 
-    for(uint32_t i = 0; i < ICON_COUNT; i++) {
-        if(icon_srcs[i] == NULL) continue;
+    icon_node_t * node;
+    LV_LL_READ(&wb->icon_ll, node) {
+        if(node->src == NULL) continue;
 
-        float row = icons[i].q;
+        int32_t row = node->q;
         if(!has_active) {
             min_row = row;
             max_row = row;
@@ -107,169 +350,182 @@ static void update_active_row_center(void)
         }
     }
 
-    row_center = has_active ? (min_row + max_row) * 0.5f : default_row_center;
+    wb->row_center = has_active ? (((min_row + max_row) * FX_ONE) / 2) : wb->default_row_center;
 }
 
-static void row_layout_to_pixel(float row, float col, float * x, float * y)
+static void row_layout_to_pixel(watch_bubble_t * wb, int32_t row, int32_t col, int32_t * x, int32_t * y)
 {
-    int row_i = (int)row;
-    int bubble_count = (row_i % 2 == 0) ? 3 : 4;
-    float row_half_span = ((float)bubble_count - 1.0f) * 0.5f;
+    int32_t bubble_count = (row % 2 == 0) ? 3 : 4;
+    int32_t row_half_span = ((bubble_count - 1) * FX_ONE) / 2;
 
-    *x = (col - row_half_span) * ROW_PITCH_X;
-    *y = (row - row_center) * ROW_PITCH_Y;
+    *x = fx_mul((col * FX_ONE) - row_half_span, ROW_PITCH_X);
+    *y = fx_mul((row * FX_ONE) - wb->row_center, ROW_PITCH_Y);
 }
 
-static float calc_distance_to_edge(float x, float y)
+static int32_t calc_distance_to_edge(const watch_bubble_t * wb, int32_t x, int32_t y)
 {
-    float dx = fabsf(x);
-    float dy = fabsf(y);
-    float distance_from_edge = 0.0f;
+    int32_t fringe_width = cfg_px(wb->config.fringe_width_px);
+    int32_t dx = fx_abs(x);
+    int32_t dy = fx_abs(y);
 
     if(dx <= X_RADIUS && dy <= Y_RADIUS) {
-        distance_from_edge = 0;
+        return 0;
     }
-    else if(dx <= X_RADIUS + FRINGE_WIDTH && dy <= Y_RADIUS + FRINGE_WIDTH) {
+
+    if(dx <= X_RADIUS + fringe_width && dy <= Y_RADIUS + fringe_width) {
         if(dx > X_RADIUS - CORNER_RADIUS && dy > Y_RADIUS - CORNER_RADIUS) {
-            float dx_to_corner = dx - (X_RADIUS - CORNER_RADIUS);
-            float dy_to_corner = dy - (Y_RADIUS - CORNER_RADIUS);
-            float dist_to_corner = sqrtf(dx_to_corner * dx_to_corner + dy_to_corner * dy_to_corner);
-            distance_from_edge = dist_to_corner - CORNER_RADIUS;
+            int32_t dx_to_corner = dx - (X_RADIUS - CORNER_RADIUS);
+            int32_t dy_to_corner = dy - (Y_RADIUS - CORNER_RADIUS);
+            uint64_t dist_sq = (uint64_t)dx_to_corner * (uint64_t)dx_to_corner +
+                               (uint64_t)dy_to_corner * (uint64_t)dy_to_corner;
+            return fx_sqrt_u64(dist_sq) - CORNER_RADIUS;
         }
-        else {
-            distance_from_edge = LV_MAX(dx - X_RADIUS, dy - Y_RADIUS);
-        }
+
+        return LV_MAX(dx - X_RADIUS, dy - Y_RADIUS);
+    }
+
+    if(dx > X_RADIUS - CORNER_RADIUS && dy > Y_RADIUS - CORNER_RADIUS) {
+        int32_t dx_to_corner = dx - (X_RADIUS - CORNER_RADIUS);
+        int32_t dy_to_corner = dy - (Y_RADIUS - CORNER_RADIUS);
+        uint64_t dist_sq = (uint64_t)dx_to_corner * (uint64_t)dx_to_corner +
+                           (uint64_t)dy_to_corner * (uint64_t)dy_to_corner;
+        return fx_sqrt_u64(dist_sq) - CORNER_RADIUS;
+    }
+
+    return LV_MAX(dx - X_RADIUS, dy - Y_RADIUS);
+}
+
+static int32_t calc_scale(const watch_bubble_t * wb, int32_t distance_from_edge)
+{
+    int32_t max_scale = cfg_permille(wb->config.max_scale_permille);
+    int32_t min_scale = cfg_permille(wb->config.min_scale_permille);
+    int32_t fringe_width = cfg_px(wb->config.fringe_width_px);
+
+    if(distance_from_edge <= 0) {
+        return max_scale;
+    }
+    else if(distance_from_edge <= fringe_width) {
+        return fx_lerp(0, fringe_width, distance_from_edge, max_scale, min_scale);
     }
     else {
-        if(dx > X_RADIUS - CORNER_RADIUS && dy > Y_RADIUS - CORNER_RADIUS) {
-            float dx_to_corner = dx - (X_RADIUS - CORNER_RADIUS);
-            float dy_to_corner = dy - (Y_RADIUS - CORNER_RADIUS);
-            float dist_to_corner = sqrtf(dx_to_corner * dx_to_corner + dy_to_corner * dy_to_corner);
-            distance_from_edge = dist_to_corner - CORNER_RADIUS;
-        }
-        else {
-            distance_from_edge = LV_MAX(dx - X_RADIUS, dy - Y_RADIUS);
-        }
-    }
-
-    return distance_from_edge;
-}
-
-static float interpolate(float actual_min, float actual_max, float val, float target_min, float target_max)
-{
-    if(actual_max - actual_min < 1e-6f) return target_min;
-    return ((val - actual_min) / (actual_max - actual_min)) * (target_max - target_min) + target_min;
-}
-
-static float calc_scale(float distance_from_edge)
-{
-    if(distance_from_edge <= 0.0f) {
-        return MAX_SCALE;
-    }
-    else if(distance_from_edge <= FRINGE_WIDTH) {
-        return interpolate(0.0f, FRINGE_WIDTH, distance_from_edge, MAX_SCALE, MIN_SCALE);
-    }
-    else {
-        return MIN_SCALE;
+        return min_scale;
     }
 }
 
-static void apply_boundary_compaction(float * coord, float radius, float fringe)
+static void apply_boundary_compaction(int32_t * coord, int32_t radius, int32_t fringe)
 {
-    float sign = (*coord >= 0.0f) ? 1.0f : -1.0f;
-    float abs_coord = fabsf(*coord);
+    int32_t sign = (*coord >= 0) ? 1 : -1;
+    int32_t abs_coord = fx_abs(*coord);
 
     if(abs_coord <= radius) return;
 
-    float outer = radius + fringe;
-    float t = (abs_coord - radius) / LV_MAX(1.0f, outer - radius);
-    t = clampf(t, 0.0f, 1.0f);
+    int32_t outer = radius + fringe;
+    int32_t denom = LV_MAX(FX_ONE, outer - radius);
+    int32_t t = fx_div(abs_coord - radius, denom);
+    t = fx_clamp(t, 0, FX_ONE);
 
-    float keep_ratio = 1.0f - 0.55f * t;
-    float compact_abs_coord = radius + (abs_coord - radius) * keep_ratio;
+    int32_t keep_ratio = FX_ONE - fx_mul(FX_FROM_PERMILLE(550), t);
+    int32_t compact_abs_coord = radius + fx_mul(abs_coord - radius, keep_ratio);
 
     *coord = sign * compact_abs_coord;
 }
 
-static void apply_compact_translation(float * x, float * y, float distance_from_edge)
+static void apply_compact_translation(const watch_bubble_t * wb, int32_t * x, int32_t * y, int32_t distance_from_edge)
 {
-    const float compact_strength = LV_MIN((BUBBLE_SIZE - BUBBLE_SIZE * MIN_SCALE) / 2.0f,
-                                          ROW_PITCH_X * 0.08f);
-    const float compact_limit = ROW_PITCH_X * 0.08f;
-    const float gravitation = 20.0f;
+    const int32_t min_scale = cfg_permille(wb->config.min_scale_permille);
+    const int32_t fringe_width = cfg_px(wb->config.fringe_width_px);
+    const int32_t compact_strength = LV_MIN((BUBBLE_SIZE * FX_ONE - fx_mul(FX_FROM_INT(BUBBLE_SIZE), min_scale)) / 2,
+                                            fx_mul(ROW_PITCH_X, FX_FROM_PERMILLE(80)));
+    const int32_t compact_limit = fx_mul(ROW_PITCH_X, FX_FROM_PERMILLE(80));
+    const int32_t gravitation = FX_FROM_INT(20);
 
-    float tx = 0.0f;
-    float ty = 0.0f;
+    int32_t tx = 0;
+    int32_t ty = 0;
 
-    if(distance_from_edge > 0.0f && distance_from_edge <= FRINGE_WIDTH) {
-        float interpolated = interpolate(0.0f, FRINGE_WIDTH, distance_from_edge, 0.0f, compact_strength);
+    if(distance_from_edge > 0 && distance_from_edge <= fringe_width) {
+        int32_t interpolated = fx_lerp(0, fringe_width, distance_from_edge, 0, compact_strength);
         tx = interpolated;
         ty = interpolated;
     }
-    else if(distance_from_edge > FRINGE_WIDTH) {
-        float extra = LV_MAX(0.0f, distance_from_edge - FRINGE_WIDTH - BUBBLE_SIZE / 2.0f) * gravitation / 10.0f;
+    else if(distance_from_edge > fringe_width) {
+        int32_t extra_base = LV_MAX(0, distance_from_edge - fringe_width - (FX_FROM_INT(BUBBLE_SIZE) / 2));
+        int32_t extra = fx_div(fx_mul(extra_base, gravitation), FX_FROM_INT(10));
         tx = compact_strength + extra;
         ty = compact_strength + extra;
     }
 
-    if(tx < 1e-6f && ty < 1e-6f) return;
+    if(tx == 0 && ty == 0) return;
 
-    float dx = *x;
-    float dy = *y;
-    bool is_corner = (fabsf(dy) > (Y_RADIUS - CORNER_RADIUS)) &&
-                     (fabsf(dx) > (X_RADIUS - CORNER_RADIUS));
+    int32_t dx = *x;
+    int32_t dy = *y;
+    bool is_corner = (fx_abs(dy) > (Y_RADIUS - CORNER_RADIUS)) &&
+                     (fx_abs(dx) > (X_RADIUS - CORNER_RADIUS));
 
     if(is_corner) {
-        float corner_dx = fabsf(dx) - X_RADIUS + CORNER_RADIUS;
-        float corner_dy = fabsf(dy) - Y_RADIUS + CORNER_RADIUS;
-        float theta = atan2f(corner_dy, corner_dx);
-
-        tx *= -copysignf(cosf(theta), dx);
-        ty *= -copysignf(sinf(theta), dy);
+        int32_t corner_dx = fx_abs(dx) - X_RADIUS + CORNER_RADIUS;
+        int32_t corner_dy = fx_abs(dy) - Y_RADIUS + CORNER_RADIUS;
+        int32_t dist = fx_sqrt_u64((uint64_t)corner_dx * (uint64_t)corner_dx +
+                                   (uint64_t)corner_dy * (uint64_t)corner_dy);
+        if(dist > 0) {
+            tx = fx_div(fx_mul(tx, corner_dx), dist);
+            ty = fx_div(fx_mul(ty, corner_dy), dist);
+            tx = (dx >= 0) ? -tx : tx;
+            ty = (dy >= 0) ? -ty : ty;
+        }
     }
-    else if(fabsf(dx) > X_RADIUS || fabsf(dy) > Y_RADIUS) {
-        if(fabsf(dx) > X_RADIUS) {
-            tx *= -copysignf(1.0f, dx);
-            ty = 0.0f;
+    else if(fx_abs(dx) > X_RADIUS || fx_abs(dy) > Y_RADIUS) {
+        if(fx_abs(dx) > X_RADIUS) {
+            tx = (dx >= 0) ? -tx : tx;
+            ty = 0;
         }
         else {
-            ty *= -copysignf(1.0f, dy);
-            tx = 0.0f;
+            ty = (dy >= 0) ? -ty : ty;
+            tx = 0;
         }
     }
 
-    tx = clampf(tx, -compact_limit, compact_limit);
-    ty = clampf(ty, -compact_limit, compact_limit);
+    tx = fx_clamp(tx, -compact_limit, compact_limit);
+    ty = fx_clamp(ty, -compact_limit, compact_limit);
 
     *x += tx;
     *y += ty;
 }
 
-static bool calc_icon_visual(uint32_t index, float * out_x, float * out_y, float * out_scale)
+static bool calc_icon_visual(watch_bubble_t * wb, const icon_node_t * icon, int32_t * out_x, int32_t * out_y, int32_t * out_scale)
 {
-    if(index >= ICON_COUNT) return false;
+    if(wb == NULL || icon == NULL) return false;
 
-    float x, y;
-    row_layout_to_pixel(icons[index].q, icons[index].r, &x, &y);
+    int32_t view_w = get_view_w_fx(wb);
+    int32_t view_h = get_view_h_fx(wb);
+    int32_t fringe_width = cfg_px(wb->config.fringe_width_px);
+    int32_t quick_margin = FX_FROM_INT(BUBBLE_SIZE * 2);
 
-    x += offset_x;
-    y += offset_y;
+    int32_t x, y;
+    row_layout_to_pixel(wb, icon->q, icon->r, &x, &y);
 
-    float distance_from_edge = calc_distance_to_edge(x, y);
-    float scale = calc_scale(distance_from_edge);
+    x += wb->offset_x;
+    y += wb->offset_y;
 
-    apply_boundary_compaction(&x, X_RADIUS, FRINGE_WIDTH);
-    apply_boundary_compaction(&y, Y_RADIUS, FRINGE_WIDTH);
-    apply_compact_translation(&x, &y, distance_from_edge);
+    if(x < -(view_w / 2) - quick_margin || x > (view_w / 2) + quick_margin ||
+       y < -(view_h / 2) - quick_margin || y > (view_h / 2) + quick_margin) {
+        return false;
+    }
 
-    if(scale < 0.02f) return false;
+    int32_t distance_from_edge = calc_distance_to_edge(wb, x, y);
+    int32_t scale = calc_scale(wb, distance_from_edge);
 
-    x += SCREEN_W / 2.0f;
-    y += SCREEN_H / 2.0f;
+    apply_boundary_compaction(&x, X_RADIUS, fringe_width);
+    apply_boundary_compaction(&y, Y_RADIUS, fringe_width);
+    apply_compact_translation(wb, &x, &y, distance_from_edge);
 
-    int bubble_r = (int)(BUBBLE_SIZE * scale);
-    if(x + bubble_r < 0 || x - bubble_r > SCREEN_W ||
-       y + bubble_r < 0 || y - bubble_r > SCREEN_H) {
+    if(scale < FX_FROM_PERMILLE(20)) return false;
+
+     x += view_w / 2;
+     y += view_h / 2;
+
+    int32_t bubble_r = fx_mul(FX_FROM_INT(BUBBLE_SIZE), scale);
+     if(x + bubble_r < 0 || x - bubble_r > view_w ||
+         y + bubble_r < 0 || y - bubble_r > view_h) {
         return false;
     }
 
@@ -279,33 +535,36 @@ static bool calc_icon_visual(uint32_t index, float * out_x, float * out_y, float
     return true;
 }
 
-static int hit_test_icon_index(int32_t px, int32_t py)
+static int hit_test_icon_index(watch_bubble_t * wb, int32_t px, int32_t py)
 {
-    update_active_row_center();
+    if(wb == NULL || wb->container == NULL) return -1;
 
-    if(canvas == NULL) return -1;
+    update_active_row_center(wb);
 
-    lv_area_t canvas_coords;
-    lv_obj_get_coords(canvas, &canvas_coords);
-    float local_px = (float)px - (float)canvas_coords.x1;
-    float local_py = (float)py - (float)canvas_coords.y1;
+    lv_area_t container_coords;
+    lv_obj_get_coords(wb->container, &container_coords);
+    int32_t local_px = FX_FROM_INT(px - container_coords.x1);
+    int32_t local_py = FX_FROM_INT(py - container_coords.y1);
 
     int hit = -1;
-    float best_scale = -1.0f;
+    int32_t best_scale = -1;
 
-    for(uint32_t i = 0; i < ICON_COUNT; i++) {
-        if(icon_srcs[i] == NULL) continue;
+    icon_node_t * node;
+    LV_LL_READ(&wb->icon_ll, node) {
+        if(node->src == NULL) continue;
 
-        float x, y, scale;
-        if(!calc_icon_visual(i, &x, &y, &scale)) continue;
+        int32_t x, y, scale;
+        if(!calc_icon_visual(wb, node, &x, &y, &scale)) continue;
 
-        float r = BUBBLE_SIZE * scale;
-        float dx = local_px - x;
-        float dy = local_py - y;
-        if(dx * dx + dy * dy <= r * r) {
+        int32_t r = fx_mul(FX_FROM_INT(BUBBLE_SIZE), scale);
+        int32_t dx = local_px - x;
+        int32_t dy = local_py - y;
+        int64_t dist_sq = (int64_t)dx * (int64_t)dx + (int64_t)dy * (int64_t)dy;
+        int64_t radius_sq = (int64_t)r * (int64_t)r;
+        if(dist_sq <= radius_sq) {
             if(scale > best_scale) {
                 best_scale = scale;
-                hit = (int)i;
+                hit = (int)node->index;
             }
         }
     }
@@ -313,19 +572,22 @@ static int hit_test_icon_index(int32_t px, int32_t py)
     return hit;
 }
 
-static bool get_offset_y_settle_limits(float * out_min_allowed, float * out_max_allowed)
+static bool get_offset_y_settle_limits(watch_bubble_t * wb, int32_t * out_min_allowed, int32_t * out_max_allowed)
 {
-    update_active_row_center();
+    if(wb == NULL) return false;
+
+    update_active_row_center(wb);
 
     bool has_active = false;
-    float min_base_y = 0.0f;
-    float max_base_y = 0.0f;
+    int32_t min_base_y = 0;
+    int32_t max_base_y = 0;
 
-    for(uint32_t i = 0; i < ICON_COUNT; i++) {
-        if(icon_srcs[i] == NULL) continue;
+    icon_node_t * node;
+    LV_LL_READ(&wb->icon_ll, node) {
+        if(node->src == NULL) continue;
 
-        float base_x, base_y;
-        row_layout_to_pixel(icons[i].q, icons[i].r, &base_x, &base_y);
+        int32_t base_x, base_y;
+        row_layout_to_pixel(wb, node->q, node->r, &base_x, &base_y);
         LV_UNUSED(base_x);
 
         if(!has_active) {
@@ -341,14 +603,11 @@ static bool get_offset_y_settle_limits(float * out_min_allowed, float * out_max_
 
     if(!has_active) return false;
 
-    /* Strict settling limits:
-     * - lower limit: bottom-most row center aligns to screen center
-     * - upper limit: top-most row center aligns to screen center */
-    float min_allowed = -max_base_y;
-    float max_allowed = -min_base_y;
+    int32_t min_allowed = -max_base_y;
+    int32_t max_allowed = -min_base_y;
 
     if(min_allowed > max_allowed) {
-        float mid = (min_allowed + max_allowed) * 0.5f;
+        int32_t mid = (min_allowed + max_allowed) / 2;
         min_allowed = mid;
         max_allowed = mid;
     }
@@ -358,116 +617,121 @@ static bool get_offset_y_settle_limits(float * out_min_allowed, float * out_max_
     return true;
 }
 
-static bool get_offset_y_drag_limits(float * out_min_allowed, float * out_max_allowed)
+static bool get_offset_y_drag_limits(watch_bubble_t * wb, int32_t * out_min_allowed, int32_t * out_max_allowed)
 {
-    float settle_min, settle_max;
-    if(!get_offset_y_settle_limits(&settle_min, &settle_max)) return false;
+    int32_t settle_min, settle_max;
+    if(!get_offset_y_settle_limits(wb, &settle_min, &settle_max)) return false;
 
-    float span = settle_max - settle_min;
-    float extra = LV_MAX(40.0f, LV_MIN(180.0f, 48.0f + span * 0.35f));
+    int32_t span = settle_max - settle_min;
+    int32_t extra = LV_MAX(cfg_px(wb->config.y_overscroll_max_px), LV_MIN(FX_FROM_INT(180), FX_FROM_INT(48) + fx_mul(span, FX_FROM_PERMILLE(350))));
 
     *out_min_allowed = settle_min - extra;
     *out_max_allowed = settle_max + extra;
     return true;
 }
 
-static float clamp_to_settle_limits(float candidate_offset_y)
+static int32_t clamp_to_settle_limits(watch_bubble_t * wb, int32_t candidate_offset_y)
 {
-    float min_allowed, max_allowed;
-    if(!get_offset_y_settle_limits(&min_allowed, &max_allowed)) return candidate_offset_y;
-    return clampf(candidate_offset_y, min_allowed, max_allowed);
+    int32_t min_allowed, max_allowed;
+    if(!get_offset_y_settle_limits(wb, &min_allowed, &max_allowed)) return candidate_offset_y;
+    return fx_clamp(candidate_offset_y, min_allowed, max_allowed);
 }
 
-static float snap_offset_y_to_ratch(float candidate_offset_y)
+static int32_t snap_offset_y_to_ratch(watch_bubble_t * wb, int32_t candidate_offset_y)
 {
-    float snapped = round_to_step(candidate_offset_y, Y_RATCHET_STEP);
-    snapped = clamp_to_settle_limits(snapped);
+    int32_t snapped = fx_round_to_step(candidate_offset_y, cfg_px(wb->config.y_ratchet_step_px));
+    snapped = clamp_to_settle_limits(wb, snapped);
     return snapped;
 }
 
-static float apply_drag_resistance_y(float candidate_offset_y)
+static int32_t apply_drag_resistance_y(watch_bubble_t * wb, int32_t candidate_offset_y)
 {
-    float min_allowed, max_allowed;
-    if(!get_offset_y_drag_limits(&min_allowed, &max_allowed)) {
+    int32_t min_allowed, max_allowed;
+    if(!get_offset_y_drag_limits(wb, &min_allowed, &max_allowed)) {
         return candidate_offset_y;
     }
 
     if(candidate_offset_y >= min_allowed && candidate_offset_y <= max_allowed) {
-        float snapped = snap_offset_y_to_ratch(candidate_offset_y);
-        float delta = snapped - candidate_offset_y;
-        if(fabsf(delta) <= Y_RATCHET_DEAD) {
-            candidate_offset_y += delta * Y_RATCHET_PULL;
+        int32_t snapped = snap_offset_y_to_ratch(wb, candidate_offset_y);
+        int32_t delta = snapped - candidate_offset_y;
+        if(fx_abs(delta) <= cfg_px(wb->config.y_ratchet_dead_px)) {
+            candidate_offset_y += fx_mul(delta, cfg_permille(wb->config.y_ratchet_pull_permille));
         }
         return candidate_offset_y;
     }
 
     if(candidate_offset_y < min_allowed) {
-        float overshoot = min_allowed - candidate_offset_y;
-        float compressed = overshoot / (1.0f + overshoot / Y_OVERSCROLL_MAX);
+        int32_t overshoot = min_allowed - candidate_offset_y;
+        int32_t compressed = fx_div(overshoot, FX_ONE + fx_div(overshoot, cfg_px(wb->config.y_overscroll_max_px)));
         return min_allowed - compressed;
     }
 
-    {
-        float overshoot = candidate_offset_y - max_allowed;
-        float compressed = overshoot / (1.0f + overshoot / Y_OVERSCROLL_MAX);
-        return max_allowed + compressed;
-    }
+    int32_t overshoot = candidate_offset_y - max_allowed;
+    int32_t compressed = fx_div(overshoot, FX_ONE + fx_div(overshoot, cfg_px(wb->config.y_overscroll_max_px)));
+    return max_allowed + compressed;
 }
 
-static void refresh_icon_objects(void)
+static void refresh_icon_objects(watch_bubble_t * wb)
 {
-    if(canvas == NULL) return;
+    if(wb == NULL || wb->container == NULL) return;
 
-    update_active_row_center();
+    update_active_row_center(wb);
 
     bool has_pressed_center = false;
-    float pressed_x = 0.0f;
-    float pressed_y = 0.0f;
-    if(press_anim_progress > 1e-4f && pressed_icon_index >= 0 && pressed_icon_index < (int)ICON_COUNT && icon_srcs[pressed_icon_index] != NULL) {
-        float pressed_scale;
-        has_pressed_center = calc_icon_visual((uint32_t)pressed_icon_index, &pressed_x, &pressed_y, &pressed_scale);
+    int32_t pressed_x = 0;
+    int32_t pressed_y = 0;
+    icon_node_t * pressed_node = NULL;
+    if(wb->press_anim_progress > FX_EPSILON && wb->pressed_icon_index >= 0) {
+        pressed_node = get_icon_node_by_index(wb, (uint32_t)wb->pressed_icon_index);
     }
 
-    for(uint32_t i = 0; i < ICON_COUNT; i++) {
-        lv_obj_t * bubble = bubble_objs[i];
-        lv_obj_t * image = image_objs[i];
+    if(pressed_node != NULL && pressed_node->src != NULL) {
+        int32_t pressed_scale;
+        has_pressed_center = calc_icon_visual(wb, pressed_node, &pressed_x, &pressed_y, &pressed_scale);
+        LV_UNUSED(pressed_scale);
+    }
+
+    icon_node_t * node;
+    LV_LL_READ(&wb->icon_ll, node) {
+        lv_obj_t * bubble = node->bubble_obj;
+        lv_obj_t * image = node->image_obj;
         if(bubble == NULL || image == NULL) continue;
 
-        if(icon_srcs[i] == NULL) {
+        if(node->src == NULL) {
             lv_obj_add_flag(bubble, LV_OBJ_FLAG_HIDDEN);
             continue;
         }
 
-        float x, y, scale;
-        if(!calc_icon_visual(i, &x, &y, &scale)) {
+        int32_t x, y, scale;
+        if(!calc_icon_visual(wb, node, &x, &y, &scale)) {
             lv_obj_add_flag(bubble, LV_OBJ_FLAG_HIDDEN);
             continue;
         }
 
-        if(has_pressed_center && (int)i != pressed_icon_index) {
-            float vx = pressed_x - x;
-            float vy = pressed_y - y;
-            float dist = sqrtf(vx * vx + vy * vy);
-            if(dist > 1e-3f && dist < PRESS_NEIGHBOR_RADIUS) {
-                float t = 1.0f - dist / PRESS_NEIGHBOR_RADIUS;
-                float pull = PRESS_NEIGHBOR_PULL * t * press_anim_progress;
-                x += (vx / dist) * pull;
-                y += (vy / dist) * pull;
+        if(has_pressed_center && (int)node->index != wb->pressed_icon_index) {
+            int32_t vx = pressed_x - x;
+            int32_t vy = pressed_y - y;
+            int32_t dist = fx_sqrt_u64((uint64_t)vx * (uint64_t)vx + (uint64_t)vy * (uint64_t)vy);
+            if(dist > FX_EPSILON && dist < PRESS_NEIGHBOR_RADIUS) {
+                int32_t t = FX_ONE - fx_div(dist, PRESS_NEIGHBOR_RADIUS);
+                int32_t pull = fx_mul(PRESS_NEIGHBOR_PULL, fx_mul(t, wb->press_anim_progress));
+                x += fx_mul(fx_div(vx, dist), pull);
+                y += fx_mul(fx_div(vy, dist), pull);
             }
         }
 
-        lv_color_t bubble_color = bubble_colors[i];
-        bool is_pressed = ((int)i == pressed_icon_index) && press_anim_progress > 1e-4f;
+        lv_color_t bubble_color = node->bubble_color;
+        bool is_pressed = ((int)node->index == wb->pressed_icon_index) && wb->press_anim_progress > FX_EPSILON;
         if(is_pressed) {
-            float press_scale = interpolate(0.0f, 1.0f, press_anim_progress, 1.0f, PRESS_SCALE);
-            scale *= press_scale;
-            lv_opa_t darken_lvl = (lv_opa_t)(PRESS_DARKEN_LVL * press_anim_progress);
+            int32_t press_scale = fx_lerp(0, FX_ONE, wb->press_anim_progress, FX_ONE, PRESS_SCALE);
+            scale = fx_mul(scale, press_scale);
+            lv_opa_t darken_lvl = (lv_opa_t)(((int64_t)PRESS_DARKEN_LVL * wb->press_anim_progress + FX_HALF) / FX_ONE);
             bubble_color = lv_color_darken(bubble_color, darken_lvl);
         }
 
-        int32_t bubble_r = (int32_t)(BUBBLE_SIZE * scale);
-        float y_center_dist = fabsf(y - SCREEN_H * 0.5f);
-        if(bubble_r < 1 || (bubble_r <= 1 && y_center_dist > Y_RADIUS)) {
+        int32_t bubble_r = fx_mul(FX_FROM_INT(BUBBLE_SIZE), scale) >> FX_SHIFT;
+        int32_t y_center_dist = fx_abs(y - (get_view_h_fx(wb) / 2));
+        if(bubble_r < 2 || (bubble_r <= 2 && y_center_dist > Y_RADIUS)) {
             lv_obj_add_flag(bubble, LV_OBJ_FLAG_HIDDEN);
             continue;
         }
@@ -476,56 +740,46 @@ static void refresh_icon_objects(void)
 
         lv_obj_clear_flag(bubble, LV_OBJ_FLAG_HIDDEN);
         lv_obj_set_size(bubble, diameter, diameter);
-        lv_obj_set_pos(bubble, (int32_t)x - bubble_r, (int32_t)y - bubble_r);
+        lv_obj_set_pos(bubble, fx_to_int_round(x) - bubble_r, fx_to_int_round(y) - bubble_r);
         lv_obj_set_style_bg_color(bubble, bubble_color, 0);
 
         lv_obj_set_size(image, diameter, diameter);
         lv_obj_center(image);
         lv_obj_set_style_image_recolor(image, lv_color_black(), 0);
-        lv_opa_t image_darken_opa = is_pressed ? (lv_opa_t)(PRESS_IMAGE_DARKEN_LVL * press_anim_progress) : LV_OPA_TRANSP;
+        lv_opa_t image_darken_opa = is_pressed ? (lv_opa_t)(((int64_t)PRESS_IMAGE_DARKEN_LVL * wb->press_anim_progress + FX_HALF) / FX_ONE) : LV_OPA_TRANSP;
         lv_obj_set_style_image_recolor_opa(image, image_darken_opa, 0);
     }
+
+    wb->needs_refresh = false;
 }
 
-static void init_icon_slots(void)
+static void init_icon_slots(watch_bubble_t * wb)
 {
-    int index = 0;
-    int row = 0;
+    if(wb == NULL) return;
 
-    lv_color_t default_color = lv_color_hex(0x888888);
-
-    while(index < ICON_COUNT) {
-        int bubble_count = (row % 2 == 0) ? 3 : 4;
-        for(int col = 0; col < bubble_count && index < ICON_COUNT; col++) {
-            icons[index].q = (float)row;
-            icons[index].r = (float)col;
-            bubble_colors[index] = default_color;
-            icon_srcs[index] = NULL;
-            icon_user_datas[index] = NULL;
-            bubble_objs[index] = NULL;
-            image_objs[index] = NULL;
-            index++;
-        }
-        row++;
+    if(!wb->icon_ll_ready) {
+        lv_ll_init(&wb->icon_ll, sizeof(icon_node_t));
+        wb->icon_ll_ready = true;
     }
 
-    row_center = ((float)row - 1.0f) * 0.5f;
-    default_row_center = row_center;
+    clear_icon_list(wb);
+    wb->row_center = 0;
+    wb->default_row_center = 0;
 }
 
-static void create_icon_object(uint32_t index)
+static void create_icon_object(watch_bubble_t * wb, icon_node_t * node)
 {
-    if(index >= ICON_COUNT) return;
-    if(canvas == NULL) return;
-    if(bubble_objs[index] != NULL || image_objs[index] != NULL) return;
+    if(wb == NULL || node == NULL) return;
+    if(wb->container == NULL) return;
+    if(node->bubble_obj != NULL || node->image_obj != NULL) return;
 
-    lv_obj_t * bubble = lv_obj_create(canvas);
-    bubble_objs[index] = bubble;
+    lv_obj_t * bubble = lv_obj_create(wb->container);
+    node->bubble_obj = bubble;
 
     lv_obj_set_size(bubble, BUBBLE_SIZE * 2, BUBBLE_SIZE * 2);
     lv_obj_set_style_radius(bubble, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_opa(bubble, LV_OPA_COVER, 0);
-    lv_obj_set_style_bg_color(bubble, bubble_colors[index], 0);
+    lv_obj_set_style_bg_color(bubble, node->bubble_color, 0);
     lv_obj_set_style_border_width(bubble, 0, 0);
     lv_obj_set_style_pad_all(bubble, 0, 0);
     lv_obj_set_style_clip_corner(bubble, true, 0);
@@ -534,7 +788,7 @@ static void create_icon_object(uint32_t index)
     lv_obj_clear_flag(bubble, LV_OBJ_FLAG_CLICKABLE);
 
     lv_obj_t * img = lv_image_create(bubble);
-    image_objs[index] = img;
+    node->image_obj = img;
 
     lv_obj_set_size(img, BUBBLE_SIZE * 2, BUBBLE_SIZE * 2);
     lv_image_set_inner_align(img, LV_IMAGE_ALIGN_COVER);
@@ -547,24 +801,33 @@ static void create_icon_object(uint32_t index)
 
 static void pressed_event(lv_event_t * e)
 {
+    lv_obj_t * obj = lv_event_get_current_target(e);
+    watch_bubble_t * wb = get_instance(obj);
+    if(wb == NULL) return;
+
     lv_indev_t * indev = lv_indev_get_act();
     if(!indev) return;
 
-    lv_indev_get_point(indev, &press_start_point);
-    pointer_is_down = true;
-    press_moved = false;
-    velocity_x = 0.0f;
-    velocity_y = 0.0f;
-    press_candidate_index = hit_test_icon_index(press_start_point.x, press_start_point.y);
-    pressed_icon_index = press_candidate_index;
-    press_anim_target = (pressed_icon_index >= 0) ? 1.0f : 0.0f;
-    refresh_icon_objects();
+    lv_indev_get_point(indev, &wb->press_start_point);
+    wb->pointer_is_down = true;
+    wb->press_moved = false;
+    wb->velocity_x = 0;
+    wb->velocity_y = 0;
+    wb->press_candidate_index = hit_test_icon_index(wb, wb->press_start_point.x, wb->press_start_point.y);
+    wb->pressed_icon_index = wb->press_candidate_index;
+    wb->press_anim_target = (wb->pressed_icon_index >= 0) ? FX_ONE : 0;
+    mark_refresh(wb);
+    refresh_if_needed(wb);
 
     LV_UNUSED(e);
 }
 
 static void drag_event(lv_event_t * e)
 {
+    lv_obj_t * obj = lv_event_get_current_target(e);
+    watch_bubble_t * wb = get_instance(obj);
+    if(wb == NULL) return;
+
     lv_indev_t * indev = lv_indev_get_act();
     if(!indev) return;
 
@@ -573,195 +836,328 @@ static void drag_event(lv_event_t * e)
 
     lv_point_t point;
     lv_indev_get_point(indev, &point);
-    if(!press_moved) {
-        int32_t moved_x = LV_ABS(point.x - press_start_point.x);
-        int32_t moved_y = LV_ABS(point.y - press_start_point.y);
+    if(!wb->press_moved) {
+        int32_t moved_x = LV_ABS(point.x - wb->press_start_point.x);
+        int32_t moved_y = LV_ABS(point.y - wb->press_start_point.y);
         if(moved_x > TAP_MOVE_TOLERANCE || moved_y > TAP_MOVE_TOLERANCE) {
-            press_moved = true;
-            /* Cancel pressed state once drag exceeds tap threshold. */
-            press_anim_target = 0.0f;
+            wb->press_moved = true;
+            wb->press_anim_target = 0;
         }
     }
 
-    offset_x += vect.x * X_DRAG_FACTOR;
-    {
-        float candidate_y = offset_y + vect.y;
-        offset_y = apply_drag_resistance_y(candidate_y);
-    }
-    offset_x = clampf(offset_x, -MAX_X_OFFSET, MAX_X_OFFSET);
+    wb->offset_x += fx_mul(vect.x * FX_ONE, cfg_permille(wb->config.x_drag_factor_permille));
+    wb->offset_y = apply_drag_resistance_y(wb, wb->offset_y + (vect.y * FX_ONE));
+    wb->offset_x = fx_clamp(wb->offset_x, -cfg_px(wb->config.max_x_offset_px), cfg_px(wb->config.max_x_offset_px));
 
-    velocity_x = vect.x * X_DRAG_FACTOR;
-    velocity_y = vect.y;
+    wb->velocity_x = fx_mul(vect.x * FX_ONE, cfg_permille(wb->config.x_drag_factor_permille));
+    wb->velocity_y = vect.y * FX_ONE;
 
-    refresh_icon_objects();
+    mark_refresh(wb);
+    refresh_if_needed(wb);
     LV_UNUSED(e);
 }
 
 static void released_event(lv_event_t * e)
 {
+    lv_obj_t * obj = lv_event_get_current_target(e);
+    watch_bubble_t * wb = get_instance(obj);
+    if(wb == NULL) return;
+
     lv_indev_t * indev = lv_indev_get_act();
-    pointer_is_down = false;
+    wb->pointer_is_down = false;
     if(!indev) {
-        pressed_icon_index = -1;
-        press_candidate_index = -1;
-        refresh_icon_objects();
+        wb->pressed_icon_index = -1;
+        wb->press_candidate_index = -1;
+        refresh_icon_objects(wb);
         return;
     }
 
     lv_point_t release_point;
     lv_indev_get_point(indev, &release_point);
 
-    int32_t moved_x = LV_ABS(release_point.x - press_start_point.x);
-    int32_t moved_y = LV_ABS(release_point.y - press_start_point.y);
-    bool is_click = !press_moved && moved_x <= TAP_MOVE_TOLERANCE && moved_y <= TAP_MOVE_TOLERANCE;
+    int32_t moved_x = LV_ABS(release_point.x - wb->press_start_point.x);
+    int32_t moved_y = LV_ABS(release_point.y - wb->press_start_point.y);
+    bool is_click = !wb->press_moved && moved_x <= TAP_MOVE_TOLERANCE && moved_y <= TAP_MOVE_TOLERANCE;
 
-    int release_index = hit_test_icon_index(release_point.x, release_point.y);
-    if(is_click && release_index >= 0 && release_index == press_candidate_index && icon_click_cb) {
-        icon_click_cb((uint32_t)release_index, icon_user_datas[release_index], icon_click_user_ctx);
+    int release_index = hit_test_icon_index(wb, release_point.x, release_point.y);
+    icon_node_t * release_node = (release_index >= 0) ? get_icon_node_by_index(wb, (uint32_t)release_index) : NULL;
+    wb->pending_click_valid = false;
+    if(is_click && release_index >= 0 && release_index == wb->press_candidate_index && release_node != NULL) {
+        wb->pending_click.index = (uint32_t)release_index;
+        wb->pending_click.icon_user_data = release_node->user_data;
+        wb->pending_click_valid = true;
     }
 
-    press_anim_target = 0.0f;
-    press_candidate_index = -1;
-    refresh_icon_objects();
+    wb->press_anim_target = 0;
+    wb->press_candidate_index = -1;
+    mark_refresh(wb);
+    refresh_if_needed(wb);
 
     LV_UNUSED(e);
 }
 
-static void inertia_timer(lv_timer_t * t)
+static void clicked_event(lv_event_t * e)
 {
-    LV_UNUSED(t);
+    lv_obj_t * obj = lv_event_get_current_target(e);
+    watch_bubble_t * wb = get_instance(obj);
+    if(wb == NULL) return;
 
-    float anim_speed = (press_anim_progress < press_anim_target) ? PRESS_ANIM_IN_SPEED : PRESS_ANIM_OUT_SPEED;
-    press_anim_progress += (press_anim_target - press_anim_progress) * anim_speed;
-    if(fabsf(press_anim_target - press_anim_progress) < 0.001f) {
-        press_anim_progress = press_anim_target;
-    }
-
-    if(!pointer_is_down && press_anim_progress <= 0.001f && press_anim_target <= 0.001f) {
-        press_anim_progress = 0.0f;
-        if(pressed_icon_index != -1) {
-            pressed_icon_index = -1;
-        }
-    }
-
-    if(pointer_is_down) {
-        refresh_icon_objects();
+    if(wb->dispatching_custom_click) {
         return;
     }
 
-    velocity_x *= X_INERTIA_DAMP;
-    velocity_y *= 0.92f;
+    if(!wb->pending_click_valid) {
+        lv_event_stop_processing(e);
+        return;
+    }
 
-    offset_x += velocity_x;
-    offset_y += velocity_y;
+    lv_watch_bubble_click_event_t event_data = wb->pending_click;
+    wb->pending_click_valid = false;
+    wb->dispatching_custom_click = true;
 
-    /* Stronger horizontal spring-back to center while still respecting max drag range */
-    velocity_x = velocity_x * X_SPRING_DAMP + (-offset_x) * X_SPRING_K;
-    offset_x = clampf(offset_x, -MAX_X_OFFSET, MAX_X_OFFSET);
+    /* Suppress the native CLICKED callback chain and forward one payloaded CLICKED event. */
+    lv_event_stop_processing(e);
+    lv_obj_send_event(wb->container, LV_EVENT_CLICKED, &event_data);
 
-    float min_allowed, max_allowed;
-    if(get_offset_y_settle_limits(&min_allowed, &max_allowed)) {
-        float snap_target = snap_offset_y_to_ratch(offset_y);
-        float correction = 0.0f;
-        if(offset_y < min_allowed) {
-            correction = min_allowed - offset_y;
+    wb->dispatching_custom_click = false;
+}
+
+static void inertia_timer(lv_timer_t * t)
+{
+    watch_bubble_t * wb = lv_timer_get_user_data(t);
+    if(wb == NULL || wb->container == NULL) return;
+
+    bool changed = false;
+
+    int32_t old_press_anim = wb->press_anim_progress;
+    int old_pressed_idx = wb->pressed_icon_index;
+    int32_t old_velocity_x = wb->velocity_x;
+    int32_t old_velocity_y = wb->velocity_y;
+    int32_t old_offset_x = wb->offset_x;
+    int32_t old_offset_y = wb->offset_y;
+
+    int32_t anim_speed = (wb->press_anim_progress < wb->press_anim_target) ? PRESS_ANIM_IN_SPEED : PRESS_ANIM_OUT_SPEED;
+    wb->press_anim_progress += fx_mul(wb->press_anim_target - wb->press_anim_progress, anim_speed);
+    if(fx_abs(wb->press_anim_target - wb->press_anim_progress) < FX_EPSILON) {
+        wb->press_anim_progress = wb->press_anim_target;
+    }
+
+    if(!wb->pointer_is_down && wb->press_anim_progress <= FX_EPSILON && wb->press_anim_target <= FX_EPSILON) {
+        wb->press_anim_progress = 0;
+        if(wb->pressed_icon_index != -1) {
+            wb->pressed_icon_index = -1;
         }
-        else if(offset_y > max_allowed) {
-            correction = max_allowed - offset_y;
+    }
+
+    if(wb->press_anim_progress != old_press_anim || wb->pressed_icon_index != old_pressed_idx) {
+        changed = true;
+    }
+
+    if(wb->pointer_is_down) {
+        if(changed) mark_refresh(wb);
+        refresh_if_needed(wb);
+        return;
+    }
+
+    wb->velocity_x = fx_mul(wb->velocity_x, cfg_permille(wb->config.x_inertia_damp_permille));
+    wb->velocity_y = fx_mul(wb->velocity_y, FX_FROM_PERMILLE(920));
+
+    wb->offset_x += wb->velocity_x;
+    wb->offset_y += wb->velocity_y;
+
+    wb->velocity_x = fx_mul(wb->velocity_x, cfg_permille(wb->config.x_spring_damp_permille)) + fx_mul(-wb->offset_x, cfg_permille(wb->config.x_spring_k_permille));
+    wb->offset_x = fx_clamp(wb->offset_x, -cfg_px(wb->config.max_x_offset_px), cfg_px(wb->config.max_x_offset_px));
+
+    int32_t min_allowed, max_allowed;
+    if(get_offset_y_settle_limits(wb, &min_allowed, &max_allowed)) {
+        int32_t snap_target = snap_offset_y_to_ratch(wb, wb->offset_y);
+        int32_t correction = 0;
+        if(wb->offset_y < min_allowed) {
+            correction = min_allowed - wb->offset_y;
+        }
+        else if(wb->offset_y > max_allowed) {
+            correction = max_allowed - wb->offset_y;
         }
         else {
-            correction = snap_target - offset_y;
+            correction = snap_target - wb->offset_y;
         }
 
-        if(fabsf(correction) > 0.0f) {
-            velocity_y = velocity_y * Y_SPRING_DAMP + correction * ((fabsf(correction) > Y_RATCHET_DEAD) ? Y_SPRING_K : Y_RATCHET_SNAP);
-            offset_y += correction * ((fabsf(correction) > Y_RATCHET_DEAD) ? (Y_SPRING_K * 0.75f) : Y_RATCHET_SNAP);
+        if(fx_abs(correction) > 0) {
+            int32_t ratchet_dead = cfg_px(wb->config.y_ratchet_dead_px);
+            int32_t spring_factor = (fx_abs(correction) > ratchet_dead) ? cfg_permille(wb->config.y_spring_k_permille) : cfg_permille(wb->config.y_ratchet_snap_permille);
+            wb->velocity_y = fx_mul(wb->velocity_y, cfg_permille(wb->config.y_spring_damp_permille)) + fx_mul(correction, spring_factor);
+            wb->offset_y += fx_mul(correction, (fx_abs(correction) > ratchet_dead) ? FX_FROM_PERMILLE(165) : cfg_permille(wb->config.y_ratchet_snap_permille));
 
-            if(fabsf(correction) < 0.6f && fabsf(velocity_y) < 0.35f) {
-                offset_y = (offset_y < min_allowed) ? min_allowed : (offset_y > max_allowed ? max_allowed : snap_target);
-                velocity_y = 0.0f;
+            if(fx_abs(correction) < FX_FROM_PERMILLE(600) && fx_abs(wb->velocity_y) < FX_FROM_PERMILLE(350)) {
+                wb->offset_y = (wb->offset_y < min_allowed) ? min_allowed : (wb->offset_y > max_allowed ? max_allowed : snap_target);
+                wb->velocity_y = 0;
             }
         }
-        else if(fabsf(velocity_y) < 0.05f) {
-            velocity_y = 0.0f;
+        else if(fx_abs(wb->velocity_y) < FX_FROM_PERMILLE(50)) {
+            wb->velocity_y = 0;
         }
     }
 
-    if(fabsf(offset_x) < 0.02f) {
-        offset_x = 0.0f;
+    if(fx_abs(wb->offset_x) < FX_FROM_PERMILLE(20)) {
+        wb->offset_x = 0;
     }
 
-    if(fabsf(velocity_x) < 0.05f && fabsf(velocity_y) < 0.05f) {
-        velocity_x = 0.0f;
-        velocity_y = 0.0f;
+    if(fx_abs(wb->velocity_x) < FX_FROM_PERMILLE(50) && fx_abs(wb->velocity_y) < FX_FROM_PERMILLE(50)) {
+        wb->velocity_x = 0;
+        wb->velocity_y = 0;
     }
 
-    refresh_icon_objects();
+    if(wb->velocity_x != old_velocity_x || wb->velocity_y != old_velocity_y ||
+       wb->offset_x != old_offset_x || wb->offset_y != old_offset_y) {
+        changed = true;
+    }
+
+    if(changed) mark_refresh(wb);
+    refresh_if_needed(wb);
+}
+
+static void delete_event(lv_event_t * e)
+{
+    lv_obj_t * obj = lv_event_get_current_target(e);
+    watch_bubble_t * wb = get_instance(obj);
+    if(wb == NULL) return;
+
+    if(wb->inertia_timer != NULL) {
+        lv_timer_delete(wb->inertia_timer);
+        wb->inertia_timer = NULL;
+    }
+
+    clear_icon_list(wb);
+    lv_obj_set_user_data(obj, NULL);
+    lv_free(wb);
+}
+
+static void size_changed_event(lv_event_t * e)
+{
+    lv_obj_t * obj = lv_event_get_current_target(e);
+    watch_bubble_t * wb = get_instance(obj);
+    if(wb == NULL) return;
+
+    mark_refresh(wb);
+    refresh_if_needed(wb);
 }
 
 lv_obj_t * lv_watch_bubble_create(lv_obj_t * parent)
 {
-    canvas = lv_obj_create(parent);
-    lv_obj_set_size(canvas, SCREEN_W, SCREEN_H);
-    lv_obj_center(canvas);
+    lv_obj_t * container = lv_obj_create(parent);
+    if(container == NULL) return NULL;
 
-    lv_obj_set_style_radius(canvas, 0, 0);
-    lv_obj_set_style_bg_color(canvas, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(canvas, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(canvas, 0, 0);
-    lv_obj_set_style_pad_all(canvas, 0, 0);
+    watch_bubble_t * wb = lv_malloc(sizeof(watch_bubble_t));
+    if(wb == NULL) {
+        lv_obj_del(container);
+        return NULL;
+    }
 
-    lv_obj_add_flag(canvas, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(canvas, LV_OBJ_FLAG_SCROLLABLE);
+    lv_memzero(wb, sizeof(*wb));
+    wb->container = container;
+    wb->pressed_icon_index = -1;
+    wb->press_candidate_index = -1;
+    init_default_config(&wb->config);
+    sanitize_config(&wb->config);
+    wb->needs_refresh = true;
 
-    init_icon_slots();
+    lv_obj_set_user_data(container, wb);
 
-    lv_obj_add_event_cb(canvas, pressed_event, LV_EVENT_PRESSED, NULL);
-    lv_obj_add_event_cb(canvas, drag_event, LV_EVENT_PRESSING, NULL);
-    lv_obj_add_event_cb(canvas, released_event, LV_EVENT_RELEASED, NULL);
+    lv_obj_set_size(container, 400, 400);
+    lv_obj_center(container);
 
-    lv_timer_create(inertia_timer, 16, NULL);
+    lv_obj_set_style_radius(container, 0, 0);
+    lv_obj_set_style_bg_color(container, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(container, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(container, 0, 0);
+    lv_obj_set_style_pad_all(container, 0, 0);
 
-    return canvas;
+    lv_obj_add_flag(container, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(container, LV_OBJ_FLAG_SCROLLABLE);
+
+    init_icon_slots(wb);
+
+    lv_obj_add_event_cb(container, pressed_event, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(container, drag_event, LV_EVENT_PRESSING, NULL);
+    lv_obj_add_event_cb(container, released_event, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(container, clicked_event, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(container, size_changed_event, LV_EVENT_SIZE_CHANGED, NULL);
+    lv_obj_add_event_cb(container, delete_event, LV_EVENT_DELETE, NULL);
+
+    wb->inertia_timer = lv_timer_create(inertia_timer, 16, wb);
+
+    return container;
 }
 
 void lv_watch_bubble_set_icon_src(lv_obj_t * obj, uint32_t index, const void * src)
 {
     if(!is_component_obj(obj)) return;
-    if(index >= ICON_COUNT) return;
 
-    icon_srcs[index] = src;
+    watch_bubble_t * wb = get_instance(obj);
+    if(wb == NULL) return;
+
+    icon_node_t * node = ensure_icon_node_by_index(wb, index);
+    if(node == NULL) return;
+
+    node->src = src;
     if(src != NULL) {
-        create_icon_object(index);
+        create_icon_object(wb, node);
     }
 
-    if(image_objs[index] && src) {
-        lv_image_set_src(image_objs[index], src);
+    if(node->image_obj != NULL && src != NULL) {
+        lv_image_set_src(node->image_obj, src);
     }
-    else if(bubble_objs[index] != NULL && image_objs[index] != NULL) {
-        lv_obj_add_flag(bubble_objs[index], LV_OBJ_FLAG_HIDDEN);
+    else if(node->bubble_obj != NULL && node->image_obj != NULL) {
+        lv_obj_add_flag(node->bubble_obj, LV_OBJ_FLAG_HIDDEN);
     }
 
     {
-        float min_allowed, max_allowed;
-        if(get_offset_y_settle_limits(&min_allowed, &max_allowed)) {
-            offset_y = clampf(offset_y, min_allowed, max_allowed);
+        int32_t min_allowed, max_allowed;
+        if(get_offset_y_settle_limits(wb, &min_allowed, &max_allowed)) {
+            wb->offset_y = fx_clamp(wb->offset_y, min_allowed, max_allowed);
         }
     }
 
-    refresh_icon_objects();
+    mark_refresh(wb);
+    refresh_if_needed(wb);
 }
 
 void lv_watch_bubble_set_icon_user_data(lv_obj_t * obj, uint32_t index, void * user_data)
 {
     if(!is_component_obj(obj)) return;
-    if(index >= ICON_COUNT) return;
-    icon_user_datas[index] = user_data;
+
+    watch_bubble_t * wb = get_instance(obj);
+    if(wb == NULL) return;
+
+    icon_node_t * node = ensure_icon_node_by_index(wb, index);
+    if(node == NULL) return;
+    node->user_data = user_data;
 }
 
-void lv_watch_bubble_set_icon_click_cb(lv_obj_t * obj, lv_watch_bubble_icon_click_cb_t cb, void * user_ctx)
+void lv_watch_bubble_init_config(lv_watch_bubble_config_t * config)
 {
-    if(!is_component_obj(obj)) return;
-    icon_click_cb = cb;
-    icon_click_user_ctx = user_ctx;
+    init_default_config(config);
+}
+
+void lv_watch_bubble_set_config(lv_obj_t * obj, const lv_watch_bubble_config_t * config)
+{
+    if(!is_component_obj(obj) || config == NULL) return;
+
+    watch_bubble_t * wb = get_instance(obj);
+    if(wb == NULL) return;
+
+    wb->config = *config;
+    sanitize_config(&wb->config);
+
+    wb->offset_x = fx_clamp(wb->offset_x, -cfg_px(wb->config.max_x_offset_px), cfg_px(wb->config.max_x_offset_px));
+
+    {
+        int32_t min_allowed, max_allowed;
+        if(get_offset_y_settle_limits(wb, &min_allowed, &max_allowed)) {
+            wb->offset_y = fx_clamp(wb->offset_y, min_allowed, max_allowed);
+        }
+    }
+
+    mark_refresh(wb);
+    refresh_if_needed(wb);
 }
