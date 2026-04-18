@@ -17,6 +17,22 @@
 #define Y_RADIUS FX_FROM_INT(90) /* Vertical radius used for edge-based scaling decisions. */
 #define CORNER_RADIUS FX_FROM_INT(30) /* Corner fillet radius for smooth edge transitions. */
 
+#ifndef WATCH_BUBBLE_DEMO_SHOW_CORE_MASK
+#define WATCH_BUBBLE_DEMO_SHOW_CORE_MASK 0 /* Show the central max-scale area with a red mask. */
+#endif
+
+#ifndef WATCH_BUBBLE_DEMO_SHOW_FRINGE_MASK
+#define WATCH_BUBBLE_DEMO_SHOW_FRINGE_MASK 0 /* Show the fringe transition area with a blue mask. */
+#endif
+
+#ifndef WATCH_BUBBLE_DEMO_SHOW_RADIUS_MASK
+#define WATCH_BUBBLE_DEMO_SHOW_RADIUS_MASK 1 /* Show translucent guides for X_RADIUS and Y_RADIUS extents. */
+#endif
+
+#ifndef WATCH_BUBBLE_DISABLE_EDGE_COMPACTION
+#define WATCH_BUBBLE_DISABLE_EDGE_COMPACTION 0 /* Disable edge crowding compaction for comparison. */
+#endif
+
 #define TAP_MOVE_TOLERANCE 12 /* Allowed finger jitter for tap detection. */
 #define PRESS_SCALE FX_FROM_PERMILLE(920) /* Scale factor when an icon is pressed. */
 #define PRESS_DARKEN_LVL LV_OPA_30 /* Bubble darkening intensity when pressed. */
@@ -63,10 +79,37 @@ typedef struct {
     lv_watch_bubble_config_t config;
     bool needs_refresh;
 
-    lv_timer_t * inertia_timer;
+#if WATCH_BUBBLE_DEMO_SHOW_CORE_MASK || WATCH_BUBBLE_DEMO_SHOW_FRINGE_MASK || WATCH_BUBBLE_DEMO_SHOW_RADIUS_MASK
+    lv_obj_t * demo_fringe_mask;
+    lv_obj_t * demo_core_mask;
+    lv_obj_t * demo_x_radius_mask;
+    lv_obj_t * demo_y_radius_mask;
+#endif
+
+    lv_timer_t * bubble_tick_timer;
 } watch_bubble_t;
 
 static void refresh_icon_objects(watch_bubble_t * wb);
+static void update_demo_overlays(watch_bubble_t * wb);
+
+#if WATCH_BUBBLE_DEMO_SHOW_CORE_MASK || WATCH_BUBBLE_DEMO_SHOW_FRINGE_MASK || WATCH_BUBBLE_DEMO_SHOW_RADIUS_MASK
+static lv_obj_t * create_demo_mask(lv_obj_t * parent, lv_color_t color, lv_opa_t opa)
+{
+    lv_obj_t * mask = lv_obj_create(parent);
+    if(mask == NULL) return NULL;
+
+    lv_obj_clear_flag(mask, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(mask, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_radius(mask, (int32_t)(CORNER_RADIUS >> FX_SHIFT), 0);
+    lv_obj_set_style_bg_color(mask, color, 0);
+    lv_obj_set_style_bg_opa(mask, opa, 0);
+    lv_obj_set_style_border_width(mask, 0, 0);
+    lv_obj_set_style_pad_all(mask, 0, 0);
+    lv_obj_set_style_outline_width(mask, 0, 0);
+    lv_obj_set_style_shadow_width(mask, 0, 0);
+    return mask;
+}
+#endif
 
 static inline int32_t fx_abs(int32_t v)
 {
@@ -491,6 +534,81 @@ static void apply_compact_translation(const watch_bubble_t * wb, int32_t * x, in
     *y += ty;
 }
 
+static void update_demo_overlays(watch_bubble_t * wb)
+{
+    if(wb == NULL || wb->container == NULL) return;
+
+#if WATCH_BUBBLE_DEMO_SHOW_CORE_MASK || WATCH_BUBBLE_DEMO_SHOW_FRINGE_MASK || WATCH_BUBBLE_DEMO_SHOW_RADIUS_MASK
+    int32_t view_w_fx = get_view_w_fx(wb);
+    int32_t view_h_fx = get_view_h_fx(wb);
+
+#if WATCH_BUBBLE_DEMO_SHOW_RADIUS_MASK
+    if(wb->demo_x_radius_mask == NULL) {
+        wb->demo_x_radius_mask = create_demo_mask(wb->container, lv_color_hex(0x8BC34A), LV_OPA_20);
+    }
+    if(wb->demo_x_radius_mask != NULL) {
+        int32_t w_px = fx_to_int_round(X_RADIUS * 2);
+        int32_t h_px = fx_to_int_round(view_h_fx);
+        if(w_px < 1) w_px = 1;
+        if(h_px < 1) h_px = 1;
+        lv_obj_set_size(wb->demo_x_radius_mask, w_px, h_px);
+        lv_obj_set_pos(wb->demo_x_radius_mask,
+                       fx_to_int_round((view_w_fx - FX_FROM_INT(w_px)) / 2),
+                       0);
+    }
+
+    if(wb->demo_y_radius_mask == NULL) {
+        wb->demo_y_radius_mask = create_demo_mask(wb->container, lv_color_hex(0x00BCD4), LV_OPA_20);
+    }
+    if(wb->demo_y_radius_mask != NULL) {
+        int32_t w_px = fx_to_int_round(view_w_fx);
+        int32_t h_px = fx_to_int_round(Y_RADIUS * 2);
+        if(w_px < 1) w_px = 1;
+        if(h_px < 1) h_px = 1;
+        lv_obj_set_size(wb->demo_y_radius_mask, w_px, h_px);
+        lv_obj_set_pos(wb->demo_y_radius_mask,
+                       0,
+                       fx_to_int_round((view_h_fx - FX_FROM_INT(h_px)) / 2));
+    }
+#endif
+
+#if WATCH_BUBBLE_DEMO_SHOW_FRINGE_MASK
+    if(wb->demo_fringe_mask == NULL) {
+        wb->demo_fringe_mask = create_demo_mask(wb->container, lv_color_hex(0x3A78FF), LV_OPA_20);
+    }
+    if(wb->demo_fringe_mask != NULL) {
+        int32_t fringe_px = cfg_px(wb->config.fringe_width_px);
+        int32_t w_px = fx_to_int_round((X_RADIUS + fringe_px) * 2);
+        int32_t h_px = fx_to_int_round((Y_RADIUS + fringe_px) * 2);
+        if(w_px < 1) w_px = 1;
+        if(h_px < 1) h_px = 1;
+        lv_obj_set_size(wb->demo_fringe_mask, w_px, h_px);
+        lv_obj_set_pos(wb->demo_fringe_mask,
+                       fx_to_int_round((view_w_fx - FX_FROM_INT(w_px)) / 2),
+                       fx_to_int_round((view_h_fx - FX_FROM_INT(h_px)) / 2));
+    }
+#endif
+
+#if WATCH_BUBBLE_DEMO_SHOW_CORE_MASK
+    if(wb->demo_core_mask == NULL) {
+        wb->demo_core_mask = create_demo_mask(wb->container, lv_color_hex(0xFF4B4B), LV_OPA_30);
+    }
+    if(wb->demo_core_mask != NULL) {
+        int32_t w_px = fx_to_int_round(X_RADIUS * 2);
+        int32_t h_px = fx_to_int_round(Y_RADIUS * 2);
+        if(w_px < 1) w_px = 1;
+        if(h_px < 1) h_px = 1;
+        lv_obj_set_size(wb->demo_core_mask, w_px, h_px);
+        lv_obj_set_pos(wb->demo_core_mask,
+                       fx_to_int_round((view_w_fx - FX_FROM_INT(w_px)) / 2),
+                       fx_to_int_round((view_h_fx - FX_FROM_INT(h_px)) / 2));
+    }
+#endif
+#else
+    LV_UNUSED(wb);
+#endif
+}
+
 static bool calc_icon_visual(watch_bubble_t * wb, const icon_node_t * icon, int32_t * out_x, int32_t * out_y, int32_t * out_scale)
 {
     if(wb == NULL || icon == NULL) return false;
@@ -514,9 +632,11 @@ static bool calc_icon_visual(watch_bubble_t * wb, const icon_node_t * icon, int3
     int32_t distance_from_edge = calc_distance_to_edge(wb, x, y);
     int32_t scale = calc_scale(wb, distance_from_edge);
 
+#if !WATCH_BUBBLE_DISABLE_EDGE_COMPACTION
     apply_boundary_compaction(&x, X_RADIUS, fringe_width);
     apply_boundary_compaction(&y, Y_RADIUS, fringe_width);
     apply_compact_translation(wb, &x, &y, distance_from_edge);
+#endif
 
     if(scale < FX_FROM_PERMILLE(20)) return false;
 
@@ -675,6 +795,7 @@ static void refresh_icon_objects(watch_bubble_t * wb)
 {
     if(wb == NULL || wb->container == NULL) return;
 
+    update_demo_overlays(wb);
     update_active_row_center(wb);
 
     bool has_pressed_center = false;
@@ -922,7 +1043,7 @@ static void clicked_event(lv_event_t * e)
     wb->dispatching_custom_click = false;
 }
 
-static void inertia_timer(lv_timer_t * t)
+static void bubble_tick_timer(lv_timer_t * t)
 {
     watch_bubble_t * wb = lv_timer_get_user_data(t);
     if(wb == NULL || wb->container == NULL) return;
@@ -1022,9 +1143,9 @@ static void delete_event(lv_event_t * e)
     watch_bubble_t * wb = get_instance(obj);
     if(wb == NULL) return;
 
-    if(wb->inertia_timer != NULL) {
-        lv_timer_delete(wb->inertia_timer);
-        wb->inertia_timer = NULL;
+    if(wb->bubble_tick_timer != NULL) {
+        lv_timer_delete(wb->bubble_tick_timer);
+        wb->bubble_tick_timer = NULL;
     }
 
     clear_icon_list(wb);
@@ -1076,6 +1197,7 @@ lv_obj_t * lv_watch_bubble_create(lv_obj_t * parent)
     lv_obj_clear_flag(container, LV_OBJ_FLAG_SCROLLABLE);
 
     init_icon_slots(wb);
+    update_demo_overlays(wb);
 
     lv_obj_add_event_cb(container, pressed_event, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(container, drag_event, LV_EVENT_PRESSING, NULL);
@@ -1084,7 +1206,7 @@ lv_obj_t * lv_watch_bubble_create(lv_obj_t * parent)
     lv_obj_add_event_cb(container, size_changed_event, LV_EVENT_SIZE_CHANGED, NULL);
     lv_obj_add_event_cb(container, delete_event, LV_EVENT_DELETE, NULL);
 
-    wb->inertia_timer = lv_timer_create(inertia_timer, 16, wb);
+    wb->bubble_tick_timer = lv_timer_create(bubble_tick_timer, 16, wb);
 
     return container;
 }
@@ -1095,6 +1217,8 @@ void lv_watch_bubble_set_icon_src(lv_obj_t * obj, uint32_t index, const void * s
 
     watch_bubble_t * wb = get_instance(obj);
     if(wb == NULL) return;
+
+    update_demo_overlays(wb);
 
     icon_node_t * node = ensure_icon_node_by_index(wb, index);
     if(node == NULL) return;
@@ -1129,6 +1253,8 @@ void lv_watch_bubble_set_icon_user_data(lv_obj_t * obj, uint32_t index, void * u
     watch_bubble_t * wb = get_instance(obj);
     if(wb == NULL) return;
 
+    update_demo_overlays(wb);
+
     icon_node_t * node = ensure_icon_node_by_index(wb, index);
     if(node == NULL) return;
     node->user_data = user_data;
@@ -1150,6 +1276,8 @@ void lv_watch_bubble_set_config(lv_obj_t * obj, const lv_watch_bubble_config_t *
     sanitize_config(&wb->config);
 
     wb->offset_x = fx_clamp(wb->offset_x, -cfg_px(wb->config.max_x_offset_px), cfg_px(wb->config.max_x_offset_px));
+
+    update_demo_overlays(wb);
 
     {
         int32_t min_allowed, max_allowed;
