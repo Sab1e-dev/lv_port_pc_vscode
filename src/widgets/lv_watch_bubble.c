@@ -938,7 +938,6 @@ static void pressed_event(lv_event_t * e)
     wb->pressed_icon_index = wb->press_candidate_index;
     wb->press_anim_target = (wb->pressed_icon_index >= 0) ? FX_ONE : 0;
     mark_refresh(wb);
-    refresh_if_needed(wb);
 
     LV_UNUSED(e);
 }
@@ -974,7 +973,6 @@ static void drag_event(lv_event_t * e)
     wb->velocity_y = vect.y * FX_ONE;
 
     mark_refresh(wb);
-    refresh_if_needed(wb);
     LV_UNUSED(e);
 }
 
@@ -989,7 +987,7 @@ static void released_event(lv_event_t * e)
     if(!indev) {
         wb->pressed_icon_index = -1;
         wb->press_candidate_index = -1;
-        refresh_icon_objects(wb);
+        mark_refresh(wb);
         return;
     }
 
@@ -1012,7 +1010,6 @@ static void released_event(lv_event_t * e)
     wb->press_anim_target = 0;
     wb->press_candidate_index = -1;
     mark_refresh(wb);
-    refresh_if_needed(wb);
 
     LV_UNUSED(e);
 }
